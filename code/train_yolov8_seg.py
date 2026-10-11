@@ -1,0 +1,1 @@
+../scripts/04_training_optimization/train_yolov8_seg.py

@@ -1,0 +1,1 @@
+../../scripts/10_visualization_demos/ckpt_cropped_real_4/live_compare_app.py

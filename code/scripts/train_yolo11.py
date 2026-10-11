@@ -1,0 +1,1 @@
+../../scripts/04_training_optimization/scripts/train_yolo11.py

@@ -1,0 +1,1 @@
+../../pipeline/01_inspection_pipelines/pipeline/video_inferenceNB.py

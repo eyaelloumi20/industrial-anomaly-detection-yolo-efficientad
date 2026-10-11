@@ -1,0 +1,1 @@
+../pipeline/01_inspection_pipelines/realtime_inspector.py

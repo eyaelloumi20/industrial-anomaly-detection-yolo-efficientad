@@ -1,0 +1,1 @@
+../pipeline/01_inspection_pipelines/single_photo_inference_seg.py

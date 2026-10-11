@@ -1,0 +1,1 @@
+../scripts/09_comparative_experiments/combined_gum_inspection_pipeline_compare_all_og.py

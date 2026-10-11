@@ -1,0 +1,1 @@
+../scripts/13_tests_diagnostics/smoke_test_k78.sh

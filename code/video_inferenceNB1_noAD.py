@@ -1,0 +1,1 @@
+../pipeline/01_inspection_pipelines/video_inferenceNB1_noAD.py

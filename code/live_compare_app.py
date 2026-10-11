@@ -1,0 +1,1 @@
+../scripts/10_visualization_demos/live_compare_app.py

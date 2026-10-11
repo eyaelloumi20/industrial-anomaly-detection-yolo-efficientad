@@ -1,0 +1,1 @@
+../scripts/13_tests_diagnostics/test_all_ema_alphas.sh

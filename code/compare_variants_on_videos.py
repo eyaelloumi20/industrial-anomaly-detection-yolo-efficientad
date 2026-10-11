@@ -1,0 +1,1 @@
+../scripts/09_comparative_experiments/compare_variants_on_videos.py

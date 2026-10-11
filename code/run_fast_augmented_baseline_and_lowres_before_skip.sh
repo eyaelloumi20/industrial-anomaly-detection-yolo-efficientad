@@ -1,0 +1,1 @@
+../scripts/04_training_optimization/run_fast_augmented_baseline_and_lowres_before_skip.sh

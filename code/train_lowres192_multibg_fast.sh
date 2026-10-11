@@ -1,0 +1,1 @@
+../scripts/04_training_optimization/train_lowres192_multibg_fast.sh

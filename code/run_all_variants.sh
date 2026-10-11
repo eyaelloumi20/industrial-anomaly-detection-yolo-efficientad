@@ -1,0 +1,1 @@
+../scripts/12_workflows/run_all_variants.sh

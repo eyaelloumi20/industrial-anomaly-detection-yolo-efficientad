@@ -1,0 +1,1 @@
+../scripts/12_workflows/run_FG_min10.sh

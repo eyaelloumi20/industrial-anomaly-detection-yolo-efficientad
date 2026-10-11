@@ -1,0 +1,1 @@
+../scripts/12_workflows/run_aug70k_lowres192_complete_test.sh

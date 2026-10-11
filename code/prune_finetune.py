@@ -1,0 +1,1 @@
+../scripts/04_training_optimization/prune_finetune.py

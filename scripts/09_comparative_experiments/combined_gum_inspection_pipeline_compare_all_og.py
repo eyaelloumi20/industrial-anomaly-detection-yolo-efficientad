@@ -1,0 +1,737 @@
+"""
+combined_gum_inspection_pipeline_compare_all.py
+==================================================
+Runs ONE video through ALL FIVE checkpoint types from this project
+(baseline / lowres / thin / qat / pruned) and produces a side-by-side
+comparison: one annotated video per method, one CSV per method, and a
+single HTML report + timing chart comparing them all.
+
+Fairness design
+----------------
+YOLO detection + ByteTrack tracking runs EXACTLY ONCE for the whole video
+(Phase 1), cached per frame. Every method then scores the SAME cached
+crops (Phase 2) -- so timing differences reflect ONLY the EfficientAD
+forward pass + preprocessing for that method, not YOLO variance, and
+accuracy-relevant score differences are being computed on identical
+regions across methods. This also means YOLO's cost (often the dominant
+cost in earlier full-pipeline runs) is paid once instead of five times.
+
+Each method uses the correct loader for its checkpoint type -- see
+benchmark_efficientad.py, which this script's dispatch logic mirrors:
+    baseline / lowres -> utils.load_efficientad_adaptive  (GPU, any image_size)
+    thin              -> utils.load_efficientad_thin       (GPU, 256px)
+    qat               -> utils.load_efficientad_qat         (CPU forced, 256px)
+    pruned            -> utils.load_efficientad_pruned      (GPU, 256px)
+
+Any --*_dir that doesn't exist is skipped, same as benchmark_efficientad.py
+--compare_all, so you don't need every checkpoint trained to use this.
+
+Thresholding is optional per-method (--baseline_threshold, etc., or
+--*_threshold_file pointing at a calibrate_threshold*.py output). Without
+one, that method runs in score-only mode (matches
+combined_gum_inspection_pipeline.py's existing behaviour).
+
+Foreign-object ("UNKNOWN") overlay
+-----------------------------------
+Same Otsu-based logic as combined_gum_inspection_pipeline.py: a global Otsu
+foreground mask, minus every YOLO-known box for that frame, drawn in red
+with an "UNKNOWN" label. The known boxes come from the SAME cached Phase 1
+detections every method already scores against, so the overlay is IDENTICAL
+across methods -- differences between methods' videos are only ever the
+EfficientAD score/verdict, never the foreign-object overlay. On by default;
+disable with --no_detect_unknown.
+
+Video naming
+------------
+Annotated videos are named to match combined_gum_inspection_pipeline.py's
+convention (same "YOLO-Detect + Track + EfficientAD (Raw Crop)" method --
+this script's five checkpoints are ALL raw-crop preprocessing, just
+different checkpoint types), with the checkpoint name appended so the five
+outputs stay distinguishable:
+    annotated_yolo-detect_track_efficientad_raw_crop_baseline_h264.mp4
+    annotated_yolo-detect_track_efficientad_raw_crop_lowres_h264.mp4
+    annotated_yolo-detect_track_efficientad_raw_crop_thin_h264.mp4
+    annotated_yolo-detect_track_efficientad_raw_crop_qat_h264.mp4
+    annotated_yolo-detect_track_efficientad_raw_crop_pruned_h264.mp4
+
+Usage
+-----
+    python combined_gum_inspection_pipeline_compare_all.py \
+        --video /path/to/video.mp4 \
+        --yolo_det_weights /path/to/best.pt \
+        --baseline_dir /home/ahmed/framework/ckpt_cropped_large \
+        --lowres_dir ./ckpt_192 \
+        --thin_dir ./ckpt_thin_025 \
+        --qat_dir ./ckpt_qat \
+        --pruned_dir ./ckpt_pruned_030 \
+        --thin_threshold_file ./calibration_thin/threshold.txt \
+        --pruned_threshold_file ./calibration_pruned/threshold.txt \
+        --save_dir ./results_compare_all \
+        --category chewinggum --model_size S
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import argparse
+import subprocess
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+OUT_CHANNELS = 384
+IMAGE_SIZE_FALLBACK = 256
+
+METHODS = ['baseline', 'lowres', 'thin', 'qat', 'pruned']
+
+METHOD_COLOURS = {   # BGR, for cv2 drawing
+    'baseline': (200, 150, 0),
+    'lowres':   (0, 200, 200),
+    'thin':     (0, 200, 0),
+    'qat':      (200, 0, 200),
+    'pruned':   (0, 100, 255),
+}
+
+
+# ── loader dispatch (mirrors benchmark_efficientad.py) ────────────────────────
+
+def load_bundle(method: str, ckpt_dir: str, category: str, model_size: str, device: str):
+    if method in ('baseline', 'lowres'):
+        from utils.load_efficientad_adaptive import load_efficientad_model
+        models = load_efficientad_model(ckpt_dir, category, model_size, device)
+        return models, models.get('image_size', IMAGE_SIZE_FALLBACK), device
+    elif method == 'thin':
+        from utils.load_efficientad_thin import load_efficientad_model
+        models = load_efficientad_model(ckpt_dir, category, model_size, device)
+        return models, IMAGE_SIZE_FALLBACK, device
+    elif method == 'qat':
+        from utils.load_efficientad_qat import load_efficientad_model
+        models = load_efficientad_model(ckpt_dir, category, model_size, device)
+        return models, IMAGE_SIZE_FALLBACK, 'cpu'
+    elif method == 'pruned':
+        from utils.load_efficientad_pruned import load_efficientad_model
+        models = load_efficientad_model(ckpt_dir, category, model_size, device)
+        return models, IMAGE_SIZE_FALLBACK, device
+    else:
+        raise ValueError(f"Unknown method '{method}'")
+
+
+def reencode_h264(input_path: str, output_path: str) -> bool:
+    """Re-encode mp4v output to H.264 so it plays back everywhere."""
+    if not os.path.exists(input_path) or os.path.getsize(input_path) < 1024:
+        print(f"  [WARN] reencode_h264: input missing or too small ({input_path})")
+        return False
+    cmd = ["ffmpeg", "-y", "-i", input_path,
+           "-vcodec", "libx264", "-pix_fmt", "yuv420p",
+           "-loglevel", "error", output_path]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0 or not os.path.exists(output_path):
+        print(f"  [WARN] ffmpeg re-encode failed (code {proc.returncode}): "
+              f"{proc.stderr.strip()[:300]}")
+        return False
+    return True
+
+
+# ── Otsu foreground / foreign-object ("UNKNOWN") detection ────────────────────
+# Ported from combined_gum_inspection_pipeline.py. Draws whatever Otsu calls
+# foreground that ISN'T inside a known YOLO box -- e.g. debris, a hand, a
+# foreign object on the belt.
+
+def otsu_mask_global(gray: np.ndarray, max_area_frac: float) -> np.ndarray:
+    """Single global Otsu threshold. Flips polarity if it flags the majority of the frame as foreground."""
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if (mask.mean() / 255.0) > max_area_frac:
+        mask = cv2.bitwise_not(mask)
+    return mask
+
+
+def clean_mask(mask: np.ndarray, kernel_size: int = 3, close_kernel_size: int = 7) -> np.ndarray:
+    """Open (remove speckle noise) then close (fill small holes / bridge gaps)."""
+    open_kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+    close_kernel = np.ones((close_kernel_size, close_kernel_size), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+    return mask
+
+
+def interior_roi_mask(h: int, w: int,
+                       margin_x_frac: float = 0.0,
+                       margin_y_frac: float = 0.0) -> np.ndarray:
+    """White interior rectangle, black margin band around all four sides.
+    ANDing this with the unknown mask drops any foreign-object contour that
+    lives in the excluded border (e.g. the conveyor's side rails)."""
+    roi = np.zeros((h, w), np.uint8)
+    mx = int(w * margin_x_frac)
+    my = int(h * margin_y_frac)
+    roi[my:h - my if my > 0 else h, mx:w - mx if mx > 0 else w] = 255
+    return roi
+
+
+def draw_unknown_contours(frame: np.ndarray, unknown_mask: np.ndarray, min_area: int) -> None:
+    """Draws foreign-object ('UNKNOWN') contours in-place."""
+    contours, _ = cv2.findContours(unknown_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        if cv2.contourArea(cnt) > min_area:
+            cv2.drawContours(frame, [cnt], -1, (0, 0, 255), 2)
+            x, y, w, h = cv2.boundingRect(cnt)
+            cv2.putText(frame, "UNKNOWN", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+
+def draw_unknown_overlay(annotated: np.ndarray, frame: np.ndarray,
+                         dets: List[Tuple[int, int, int, int, int]],
+                         otsu_max_area_frac: float, otsu_min_unknown_area: int) -> None:
+    """Computes + draws the UNKNOWN foreign-object overlay in-place on `annotated`,
+    using the raw `frame` for Otsu and `dets` (cached, shared Phase 1 boxes:
+    (tid, x1, y1, x2, y2)) as the known-region mask. Identical across every
+    method since both inputs come from the single shared Phase 1 pass."""
+    src_h, src_w = frame.shape[:2]
+    gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    non_bg_mask = otsu_mask_global(gray_full, otsu_max_area_frac)
+    known_mask = np.zeros_like(non_bg_mask)
+    for _tid, x1, y1, x2, y2 in dets:
+        cv2.rectangle(known_mask, (x1, y1), (x2, y2), 255, -1)
+    unknown_mask = cv2.bitwise_and(non_bg_mask, cv2.bitwise_not(known_mask))
+    unknown_mask = clean_mask(unknown_mask)
+    unknown_mask = cv2.bitwise_and(unknown_mask, interior_roi_mask(src_h, src_w))
+    draw_unknown_contours(annotated, unknown_mask, otsu_min_unknown_area)
+
+
+def resize_with_padding(crop: Image.Image, size: int) -> Image.Image:
+    ow, oh = crop.size
+    scale  = size / max(ow, oh)
+    nw, nh = int(ow * scale), int(oh * scale)
+    resized = crop.resize((nw, nh), Image.LANCZOS)
+    canvas  = Image.new("RGB", (size, size), (0, 0, 0))
+    canvas.paste(resized, ((size - nw) // 2, (size - nh) // 2))
+    return canvas
+
+
+def get_crop(pil_img: Image.Image, box: tuple, size: int,
+            pad_ratio: float, denoise: bool) -> Image.Image:
+    W, H = pil_img.size
+    x1, y1, x2, y2 = box
+    bw, bh = x2 - x1, y2 - y1
+    px, py = int(bw * pad_ratio), int(bh * pad_ratio)
+    x1 = max(0, x1 - px);  y1 = max(0, y1 - py)
+    x2 = min(W, x2 + px);  y2 = min(H, y2 + py)
+    crop = pil_img.crop((x1, y1, x2, y2)).convert("RGB")
+    crop = resize_with_padding(crop, size)
+    if denoise:
+        arr = np.array(crop, dtype=np.uint8)
+        arr = cv2.GaussianBlur(arr, (3, 3), sigmaX=0.8, sigmaY=0.8)
+        arr = cv2.bilateralFilter(arr, d=5, sigmaColor=15, sigmaSpace=15)
+        crop = Image.fromarray(arr)
+    return crop
+
+
+@torch.no_grad()
+def score_crop(models: dict, crop_pil: Image.Image, device: str,
+               image_size: int, ratio: float = 0.1) -> float:
+    t = transforms.ToTensor()(crop_pil).unsqueeze(0).to(device)
+    t_out = models['teacher'](t)
+    s_out = models['student'](t)
+    a_out = models['ae'](t)
+
+    y_st   = s_out[:, :OUT_CHANNELS,  :, :]
+    y_stae = s_out[:, -OUT_CHANNELS:, :, :]
+    norm_t = (t_out - models['mean']) / (models['std'] + 1e-8)
+    d_st   = torch.pow(norm_t - y_st,   2)
+    d_stae = torch.pow(a_out  - y_stae, 2)
+
+    fm_st   = F.interpolate(torch.mean(d_st,   dim=1, keepdim=True),
+                            size=(image_size, image_size), mode='bilinear', align_corners=False)
+    fm_stae = F.interpolate(torch.mean(d_stae, dim=1, keepdim=True),
+                            size=(image_size, image_size), mode='bilinear', align_corners=False)
+
+    nm_st = (ratio * (fm_st   - models['qa_st'])) / (models['qb_st'] - models['qa_st'] + 1e-8)
+    nm_ae = (ratio * (fm_stae - models['qa_ae'])) / (models['qb_ae'] - models['qa_ae'] + 1e-8)
+    amap  = (0.5 * nm_st + 0.5 * nm_ae)[0, 0].cpu().numpy()
+    return float(np.max(amap))
+
+
+# ── Phase 1: shared YOLO detection + tracking, run once ───────────────────────
+
+def run_yolo_once(video_path: str, yolo_weights: str, conf: float, iou: float,
+                  device: str, max_frames: Optional[int]):
+    """Detect+track every frame ONCE, cache boxes per frame. Returns
+    (detections: {frame_idx: [(track_id, x1,y1,x2,y2), ...]}, src_w, src_h, src_fps, n_frames)."""
+    from ultralytics import YOLO
+    print(f"[Phase 1] Loading YOLO: {yolo_weights}")
+    yolo = YOLO(yolo_weights)
+    yolo.to(device)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+    src_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[Phase 1] Source: {src_w}x{src_h} @ {src_fps:.1f}fps  (~{total} frames)")
+
+    detections: Dict[int, List[Tuple[int, int, int, int, int]]] = {}
+    frame_idx = 0
+    t0 = time.perf_counter()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if max_frames and frame_idx >= max_frames:
+            break
+
+        results = yolo.track(source=frame, conf=conf, iou=iou, classes=[0],
+                             persist=True, tracker="bytetrack.yaml", verbose=False)
+        boxes_this_frame = []
+        for r in results:
+            if r.boxes is None or len(r.boxes) == 0:
+                continue
+            xyxy = r.boxes.xyxy.cpu().numpy().astype(int)
+            ids  = (r.boxes.id.cpu().numpy().astype(int) if r.boxes.id is not None
+                   else list(range(len(xyxy))))
+            for box, tid in zip(xyxy, ids):
+                x1 = max(0, box[0]); y1 = max(0, box[1])
+                x2 = min(src_w, box[2]); y2 = min(src_h, box[3])
+                if x2 > x1 and y2 > y1:
+                    boxes_this_frame.append((int(tid), x1, y1, x2, y2))
+        detections[frame_idx] = boxes_this_frame
+
+        frame_idx += 1
+        if frame_idx % 60 == 0:
+            print(f"  [Phase 1] frame {frame_idx}/{total}  "
+                  f"({frame_idx / (time.perf_counter() - t0):.1f} fps)")
+
+    cap.release()
+    n_frames = frame_idx
+    print(f"[Phase 1] Done: {n_frames} frames, "
+          f"{sum(len(v) for v in detections.values())} total detections, "
+          f"{time.perf_counter() - t0:.1f}s")
+    return detections, src_w, src_h, src_fps, n_frames
+
+
+# ── Phase 2: score cached crops with one method's EfficientAD ────────────────
+
+@dataclass
+class MethodResult:
+    method:        str
+    n_frames:      int      = 0
+    n_detections:  int      = 0
+    mean_ms:       float    = 0.0
+    fps:           float    = 0.0
+    score_mean:    float    = 0.0
+    score_max:     float    = 0.0
+    n_anomalous:   int      = 0
+    threshold:     Optional[float] = None
+    video_path:    Optional[str]   = None
+    csv_path:      Optional[str]   = None
+    error:         Optional[str]   = None
+
+
+def run_method(method: str, ckpt_dir: str, video_path: str,
+               detections: Dict[int, List[Tuple[int, int, int, int, int]]],
+               src_w: int, src_h: int, src_fps: float, n_frames: int,
+               args, threshold: Optional[float]) -> MethodResult:
+
+    print(f"\n{'='*70}\n  Method: {method}  (ckpt={ckpt_dir})\n{'='*70}")
+    result = MethodResult(method=method, threshold=threshold)
+
+    try:
+        models, image_size, device = load_bundle(
+            method, ckpt_dir, args.category, args.model_size, args.device)
+    except Exception as e:
+        print(f"  [{method}] FAILED to load: {e}")
+        result.error = str(e)
+        return result
+
+    ema_hist: Dict[int, float] = {}
+    alpha = args.ema_alpha
+
+    save_dir = os.path.join(args.save_dir, method)
+    os.makedirs(save_dir, exist_ok=True)
+    csv_path = os.path.join(save_dir, f"scores_{method}.csv")
+    video_out_raw = os.path.join(
+        save_dir, f"annotated_yolo-detect_track_efficientad_raw_crop_{method}.mp4")
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(video_out_raw, fourcc, src_fps, (src_w, src_h)) if not args.no_video else None
+
+    cap = cv2.VideoCapture(video_path)
+    csv_file = open(csv_path, "w", newline="")
+    csv_w = csv.writer(csv_file)
+    csv_w.writerow(["frame", "track_id", "raw_score", "ema_score", "verdict",
+                    "x1", "y1", "x2", "y2", "score_ms"])
+
+    all_scores = []
+    all_ms = []
+    n_detections = 0
+    n_anomalous = 0
+    colour = METHOD_COLOURS.get(method, (255, 255, 255))
+
+    for frame_idx in range(n_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        annotated = frame.copy()
+        frame_dets = detections.get(frame_idx, [])
+
+        if writer is not None and args.detect_unknown:
+            draw_unknown_overlay(annotated, frame, frame_dets,
+                                 args.otsu_max_area_frac, args.otsu_min_unknown_area)
+
+        for tid, x1, y1, x2, y2 in frame_dets:
+            crop = get_crop(pil_frame, (x1, y1, x2, y2), image_size,
+                            args.pad_ratio, args.denoise)
+
+            t0 = time.perf_counter()
+            score = score_crop(models, crop, device, image_size, ratio=args.ratio)
+            score_ms = (time.perf_counter() - t0) * 1000.0
+
+            prev = ema_hist.get(tid, score)
+            ema = alpha * score + (1 - alpha) * prev
+            ema_hist[tid] = ema
+
+            all_scores.append(score)
+            all_ms.append(score_ms)
+            n_detections += 1
+
+            verdict = ""
+            if threshold is not None:
+                verdict = "ANOMALY" if ema >= threshold else "NORMAL"
+                if verdict == "ANOMALY":
+                    n_anomalous += 1
+
+            csv_w.writerow([frame_idx, tid, f"{score:.6f}", f"{ema:.6f}", verdict,
+                            x1, y1, x2, y2, f"{score_ms:.2f}"])
+
+            if writer is not None:
+                box_colour = colour
+                if threshold is not None:
+                    box_colour = (0, 0, 255) if verdict == "ANOMALY" else (0, 200, 0)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), box_colour, 2)
+                label = f"ID{tid} {verdict + ' ' if verdict else ''}{ema:.2f}"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                tx, ty = max(0, x1 + 3), max(th + 6, y1 + 3)
+                cv2.rectangle(annotated, (tx-2, ty-th-4), (tx+tw+4, ty+2), box_colour, -1)
+                cv2.putText(annotated, label, (tx, ty),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+        if writer is not None:
+            tag = f"{method}  |  frame {frame_idx}  |  {len(frame_dets)} dets"
+            cv2.putText(annotated, tag, (8, 24),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 2, cv2.LINE_AA)
+            writer.write(annotated)
+
+    cap.release()
+    csv_file.close()
+    if writer is not None:
+        writer.release()
+        h264_path = video_out_raw.replace(".mp4", "_h264.mp4")
+        if reencode_h264(video_out_raw, h264_path):
+            os.remove(video_out_raw)
+            result.video_path = h264_path
+        else:
+            result.video_path = video_out_raw
+
+    del models
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    result.n_frames      = n_frames
+    result.n_detections  = n_detections
+    result.mean_ms        = float(np.mean(all_ms)) if all_ms else 0.0
+    result.fps             = float(1000.0 / result.mean_ms) if result.mean_ms > 0 else 0.0
+    result.score_mean      = float(np.mean(all_scores)) if all_scores else 0.0
+    result.score_max        = float(np.max(all_scores)) if all_scores else 0.0
+    result.n_anomalous     = n_anomalous
+    result.csv_path        = csv_path
+
+    print(f"  [{method}] {n_detections} detections  mean={result.mean_ms:.2f}ms  "
+          f"({result.fps:.1f} scores/sec)  score_mean={result.score_mean:.4f}"
+          + (f"  anomalous={n_anomalous}" if threshold is not None else ""))
+    return result
+
+
+# ── HTML report + timing chart ─────────────────────────────────────────────────
+
+def save_timing_chart(results: List[MethodResult], path: str):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ok = [r for r in results if r.error is None]
+    if not ok:
+        return
+    fig, ax = plt.subplots(figsize=(7, 4), facecolor="#1a1a2e")
+    ax.set_facecolor("#1a1a2e")
+    names = [r.method for r in ok]
+    fps   = [r.fps for r in ok]
+    bars = ax.bar(names, fps, color="#e94560")
+    ax.set_ylabel("Scores / sec (EfficientAD only)", color="#eaeaea")
+    ax.set_title("Method comparison — scoring throughput", color="#eaeaea")
+    ax.tick_params(colors="#eaeaea")
+    for s in ax.spines.values():
+        s.set_edgecolor("#444")
+    for bar, v in zip(bars, fps):
+        ax.text(bar.get_x() + bar.get_width()/2, v, f"{v:.1f}",
+               ha='center', va='bottom', color="#eaeaea")
+    plt.tight_layout()
+    plt.savefig(path, dpi=120, facecolor="#1a1a2e")
+    plt.close()
+
+
+def save_html_report(results: List[MethodResult], save_dir: str, video_path: str,
+                     chart_path: str):
+    rows = ""
+    for r in results:
+        if r.error:
+            rows += (f"<tr><td>{r.method}</td><td colspan='6' style='color:#f87171'>"
+                     f"FAILED: {r.error}</td></tr>")
+            continue
+        thr = f"{r.threshold:.4f}" if r.threshold is not None else "n/a (score-only)"
+        anomalous = f"{r.n_anomalous}" if r.threshold is not None else "n/a"
+        video_link = (f"<a href='{os.path.relpath(r.video_path, save_dir)}' "
+                      f"style='color:#60a5fa'>video</a>") if r.video_path else "n/a"
+        csv_link = (f"<a href='{os.path.relpath(r.csv_path, save_dir)}' "
+                    f"style='color:#60a5fa'>csv</a>") if r.csv_path else "n/a"
+        rows += (f"<tr><td><b>{r.method}</b></td><td>{r.n_detections}</td>"
+                 f"<td>{r.mean_ms:.2f} ms</td><td>{r.fps:.1f}</td>"
+                 f"<td>{r.score_mean:.4f}</td><td>{thr}</td><td>{anomalous}</td>"
+                 f"<td>{video_link}</td><td>{csv_link}</td></tr>")
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Method Comparison Report</title>
+<style>
+body {{ background:#1a1a2e; color:#eaeaea; font-family: -apple-system, sans-serif; padding:24px; }}
+table {{ border-collapse: collapse; width:100%; margin-top:16px; }}
+th, td {{ padding:8px 12px; border-bottom:1px solid #333; text-align:left; }}
+th {{ color:#9ca3af; font-weight:600; }}
+img {{ max-width:100%; border-radius:8px; margin-top:16px; }}
+.muted {{ color:#9ca3af; }}
+</style></head>
+<body>
+<h1>Method Comparison — {os.path.basename(video_path)}</h1>
+<p class="muted">YOLO detection + tracking ran once and was shared across every method below,
+so timing and score differences reflect only the EfficientAD forward pass + preprocessing
+for each checkpoint type — not YOLO variance.</p>
+<table>
+<tr><th>Method</th><th>Detections</th><th>Mean ms/crop</th><th>Scores/sec</th>
+<th>Mean score</th><th>Threshold</th><th># Anomalous</th><th>Video</th><th>CSV</th></tr>
+{rows}
+</table>
+<img src="{os.path.basename(chart_path)}" alt="timing chart">
+</body></html>"""
+
+    path = os.path.join(save_dir, "report.html")
+    with open(path, "w") as f:
+        f.write(html)
+    return path
+
+
+# ── args + main ────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Compare all optimization methods (baseline/lowres/thin/qat/pruned) on one video.")
+    p.add_argument("--video",             required=True)
+    p.add_argument("--yolo_det_weights",  required=True)
+    p.add_argument("--baseline_dir", default="/home/ahmed/framework/ckpt_cropped_large")
+    p.add_argument("--lowres_dir",   default="./ckpt_192")
+    p.add_argument("--thin_dir",     default="./ckpt_thin_025")
+    p.add_argument("--qat_dir",      default="./ckpt_qat")
+    p.add_argument("--pruned_dir",   default="./ckpt_pruned_030")
+    p.add_argument("--skip_methods", nargs="*", default=[],
+                   help="Method names to skip even if their --*_dir exists, e.g. --skip_methods qat")
+    p.add_argument("--baseline_threshold", type=float, default=None)
+    p.add_argument("--lowres_threshold",   type=float, default=None)
+    p.add_argument("--thin_threshold",     type=float, default=None)
+    p.add_argument("--qat_threshold",      type=float, default=None)
+    p.add_argument("--pruned_threshold",   type=float, default=None)
+    p.add_argument("--baseline_threshold_file", default=None)
+    p.add_argument("--lowres_threshold_file",   default=None)
+    p.add_argument("--thin_threshold_file",     default=None)
+    p.add_argument("--qat_threshold_file",      default=None)
+    p.add_argument("--pruned_threshold_file",   default=None)
+    p.add_argument("--category",     default="chewinggum")
+    p.add_argument("--model_size",   default="S", choices=["S", "M"])
+    p.add_argument("--device",       default="cuda",
+                   help="Used for baseline/lowres/thin/pruned. qat always forces cpu regardless.")
+    p.add_argument("--ratio",        type=float, default=0.1)
+    p.add_argument("--conf",         type=float, default=0.25)
+    p.add_argument("--iou",          type=float, default=0.45)
+    p.add_argument("--pad_ratio",    type=float, default=0.02)
+    p.add_argument("--denoise",      action="store_true",
+                   help="Apply Gaussian+bilateral denoising on crops (off by default, "
+                        "matching your recent --no_denoise evaluation runs).")
+    p.add_argument("--ema_alpha",    type=float, default=0.3)
+    p.add_argument("--max_frames",   type=int, default=0)
+    p.add_argument("--no_video",     action="store_true", help="Skip saving annotated videos (faster)")
+    p.add_argument("--otsu_max_area_frac",    type=float, default=0.25,
+                   help="Polarity guard: flip Otsu mask if this fraction of the frame is flagged foreground")
+    p.add_argument("--otsu_min_unknown_area", type=int, default=20,
+                   help="Ignore UNKNOWN contours smaller than this (px)")
+    p.add_argument("--no_detect_unknown",     action="store_true",
+                   help="Disable the UNKNOWN foreign-object contour overlay on annotated videos")
+    p.add_argument("--save_dir",     default="./results_compare_all")
+    return p.parse_args()
+
+
+def check_calibration_compatibility(args, method: str, file_path: str) -> None:
+    """If a calibration_meta.json sits next to threshold.txt (written by
+    calibrate_threshold_all.py), compare its conf/pad_ratio/denoise/ema_alpha
+    against this run's args and warn loudly on any mismatch -- those params
+    changing the scored crops or the EMA smoothing invalidates the threshold."""
+    meta_path = os.path.join(os.path.dirname(file_path), "calibration_meta.json")
+    if not os.path.isfile(meta_path):
+        return
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+    except Exception as e:
+        print(f"  [{method:<10s}]   [WARN] calibration_meta.json found but unreadable "
+              f"({type(e).__name__}: {e}) -- skipping compatibility check")
+        return
+
+    checks = [
+        ("conf",       meta.get("conf"),       args.conf),
+        ("pad_ratio",  meta.get("pad_ratio"),  args.pad_ratio),
+        ("denoise",    meta.get("denoise"),    args.denoise),
+        ("ema_alpha",  meta.get("ema_alpha"),  args.ema_alpha),
+    ]
+    mismatches = [(name, cal_v, run_v) for name, cal_v, run_v in checks
+                  if cal_v is not None and cal_v != run_v]
+    if mismatches:
+        print(f"  [{method:<10s}]   [WARN] calibration/inference parameter mismatch "
+              f"-- this threshold may not be valid:")
+        for name, cal_v, run_v in mismatches:
+            print(f"  [{method:<10s}]     --{name}: calibrated with {cal_v!r}, "
+                  f"running with {run_v!r}")
+    basis = meta.get("threshold_basis")
+    if basis == "raw":
+        print(f"  [{method:<10s}]   [NOTE] calibrated on raw scores (basis='raw'), "
+              f"not EMA -- threshold compares against this run's EMA-smoothed score, "
+              f"so it may run a bit hot/cold depending on --ema_alpha.")
+
+
+def resolve_threshold(args, method: str) -> Optional[float]:
+    direct = getattr(args, f"{method}_threshold")
+    if direct is not None:
+        print(f"  [{method:<10s}] threshold = {direct:.6f}   (source: --{method}_threshold)")
+        return direct
+
+    file_path = getattr(args, f"{method}_threshold_file")
+    if not file_path:
+        print(f"  [{method:<10s}] threshold = NONE          "
+              f"(no --{method}_threshold / --{method}_threshold_file given "
+              f"-> SCORE-ONLY MODE: no ANOMALY/NORMAL verdict, no red/green box)")
+        return None
+
+    if not os.path.isfile(file_path):
+        print(f"  [{method:<10s}] threshold = NONE          "
+              f"(--{method}_threshold_file='{file_path}' NOT FOUND on disk "
+              f"-> SCORE-ONLY MODE)")
+        return None
+
+    try:
+        with open(file_path) as f:
+            raw = f.read().strip()
+        value = float(raw)
+    except Exception as e:
+        print(f"  [{method:<10s}] threshold = NONE          "
+              f"(--{method}_threshold_file='{file_path}' failed to parse "
+              f"({type(e).__name__}: {e}) -> SCORE-ONLY MODE)")
+        return None
+
+    print(f"  [{method:<10s}] threshold = {value:.6f}   (source: {file_path})")
+    check_calibration_compatibility(args, method, file_path)
+    return value
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.save_dir, exist_ok=True)
+    args.detect_unknown = not args.no_detect_unknown
+    if args.detect_unknown:
+        print("UNKNOWN foreign-object overlay : ON  "
+              f"(otsu_max_area_frac={args.otsu_max_area_frac}, "
+              f"min_area={args.otsu_min_unknown_area}px)")
+    else:
+        print("UNKNOWN foreign-object overlay : OFF")
+
+    ckpt_dirs = {
+        'baseline': args.baseline_dir, 'lowres': args.lowres_dir,
+        'thin':     args.thin_dir,     'qat':    args.qat_dir,
+        'pruned':   args.pruned_dir,
+    }
+
+    active_methods = [m for m in METHODS
+                      if m not in args.skip_methods and os.path.isdir(ckpt_dirs[m])]
+    skipped = [m for m in METHODS if m not in active_methods]
+    print(f"Active methods : {active_methods}")
+    if skipped:
+        print(f"Skipped        : {skipped}  (missing --*_dir or in --skip_methods)")
+    if not active_methods:
+        raise SystemExit("No checkpoint directories found. Nothing to compare.")
+
+    # ── Resolve thresholds upfront (loud, fails fast) ──────────────────────────
+    print(f"\n{'='*70}\n  Threshold check\n{'='*70}")
+    thresholds = {m: resolve_threshold(args, m) for m in active_methods}
+    n_missing = sum(1 for t in thresholds.values() if t is None)
+    if n_missing:
+        missing_methods = [m for m, t in thresholds.items() if t is None]
+        print(f"\n  WARNING: {n_missing} method(s) have NO threshold -> "
+              f"{missing_methods} will run in score-only mode "
+              f"(no red/green box, no ANOMALY/NORMAL verdict, empty CSV verdict "
+              f"column). Pass --<method>_threshold_file to fix.")
+    print()
+
+    # ── Phase 1: YOLO once, shared across every method ────────────────────────
+    detections, src_w, src_h, src_fps, n_frames = run_yolo_once(
+        args.video, args.yolo_det_weights, args.conf, args.iou,
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        max_frames=(args.max_frames or None))
+
+    # ── Phase 2: score with each method ────────────────────────────────────────
+    results = []
+    for method in active_methods:
+        r = run_method(method, ckpt_dirs[method], args.video, detections,
+                       src_w, src_h, src_fps, n_frames, args, thresholds[method])
+        results.append(r)
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    chart_path = os.path.join(args.save_dir, "timing_comparison.png")
+    save_timing_chart(results, chart_path)
+    report_path = save_html_report(results, args.save_dir, args.video, chart_path)
+
+    print(f"\n{'='*70}\n  Summary\n{'='*70}")
+    print(f"  {'method':<10s} {'dets':>6s} {'ms/crop':>9s} {'scores/s':>9s} "
+          f"{'mean_score':>11s} {'anomalous':>10s}")
+    for r in results:
+        if r.error:
+            print(f"  {r.method:<10s}  FAILED: {r.error}")
+            continue
+        anomalous = str(r.n_anomalous) if r.threshold is not None else "n/a"
+        print(f"  {r.method:<10s} {r.n_detections:>6d} {r.mean_ms:>9.2f} "
+              f"{r.fps:>9.1f} {r.score_mean:>11.4f} {anomalous:>10s}")
+
+    print(f"\nReport      → {report_path}")
+    print(f"Timing chart → {chart_path}")
+    for r in results:
+        if r.video_path:
+            print(f"{r.method:<10s} video → {r.video_path}")
+
+
+if __name__ == '__main__':
+    main()

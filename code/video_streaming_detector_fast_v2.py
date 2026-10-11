@@ -1,0 +1,1 @@
+../pipeline/01_inspection_pipelines/video_streaming_detector_fast_v2.py

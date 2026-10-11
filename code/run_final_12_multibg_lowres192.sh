@@ -1,0 +1,1 @@
+../scripts/12_workflows/run_final_12_multibg_lowres192.sh

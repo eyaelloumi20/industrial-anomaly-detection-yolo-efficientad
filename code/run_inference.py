@@ -1,0 +1,1 @@
+../pipeline/01_inspection_pipelines/run_inference.py

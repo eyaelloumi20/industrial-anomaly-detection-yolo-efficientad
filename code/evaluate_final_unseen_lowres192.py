@@ -1,0 +1,1 @@
+../scripts/07_evaluation_validation/evaluate_final_unseen_lowres192.py
